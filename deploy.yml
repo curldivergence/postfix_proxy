@@ -1,0 +1,393 @@
+---
+- hosts: localhost
+  connection: local
+  vars:
+    remote_host: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          61383836636661633564626266303034393165666531356233653939363965383039646132373863
+          6333396137623230336638623539323831353036396536610a623966303336376538313238343466
+          34373035653639303165666536393239396232643866313539303763316436393538643361613330
+          3635633162373936620a373130373033316334626135313064323763386330306533616338313036
+          6330
+
+    docker_tls_port: 2376
+  tasks:
+    - name: create image with python installed
+      docker_image:
+        docker_host: "{{ remote_host }}:{{ docker_tls_port }}"
+        tls_hostname: "{{ remote_host }}"
+        tls_verify: yes
+        cacert_path: tls_cli/ca.pem
+        cert_path: tls_cli/cert.pem
+        key_path: tls_cli/key.pem
+        name: postfix_image
+        path: "."
+        state: present
+        force: yes
+
+    - name: create postfix container
+      docker_container:
+        docker_host: "{{ remote_host }}:{{ docker_tls_port }}"
+        tls_hostname: "{{ remote_host }}"
+        tls_verify: yes
+        cacert_path: tls_cli/ca.pem
+        cert_path: tls_cli/cert.pem
+        key_path: tls_cli/key.pem
+        name: postfix_proxy
+        image: "postfix_image"
+        ports:
+          - "25:25"
+          - "587:587"
+        recreate: yes
+        detach: yes
+        tty: yes # needed to keep container running
+
+    - name: add container to inventory
+      add_host:
+        name: "postfix_proxy"
+        ansible_docker_extra_args: "--tlsverify --tlscacert=tls_cli/ca.pem --tlscert=tls_cli/cert.pem 
+          --tlskey=tls_cli/key.pem -H={{ remote_host }}:{{ docker_tls_port }}"
+        ansible_connection: docker
+        ansible_user: root
+      changed_when: false
+
+- hosts: postfix_proxy
+  gather_facts: yes
+  connection: docker
+  vars:
+    username: "mail"
+    domain: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          62636334353337373463396331363065356563666432323464386162323730383635623965303133
+          3862313636333564396639643730303364376263363464370a616231626336363563613666356230
+          62666439663130356564646330363234303830313333393037323333636136346434336262383633
+          3536663838656662340a373966326166623735303863623866346164623733323734356637373764
+          6462
+
+    mail_domain: "mail.{{ domain }}"
+    forward_email: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          61636430613762666534383939666665313639306666313861366336373032356632373761616633
+          3832346362656330643566616439613034643831656265370a666239343064353465343033333062
+          38323061313730393332646338616335656464343533353762383038313834383761623135373863
+          3365363161346636380a386562383338373135303764313363396365623963323134303062613232
+          37336433623863326132643732333534346361396364356432393930363062626663
+
+    country: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          30386333383366643135646637376335616635323331313239613961663465333232316630313138
+          6466643931303335343130616162373062313265333235360a316163366465646532313264333164
+          61383565376631326434626462323034313537383735343665356562316231353365383536646537
+          3836613538613039300a623232376263663839646433613166316462383538653236616132656630
+          3134
+
+    organization: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          61316637353538636330353633333764613534393037653562323734663239383964656166373232
+          3532616335663330313031386631643439373465303937350a643538383466616561616435636633
+          33336533383338363462363031373966343465323230376634666137323138653831646537303737
+          6663633332663032380a663338326139343233393533626265396434353262643666613032333230
+          6430
+
+    sasl2_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          39363337363738653239363665353437373961353361303465633236316662626461396562386437
+          6531626637626630616535363432633762646630383837330a663036306466393363656636646262
+          34623363316137323761383665323230336238346464613239316231343336363262643433613562
+          3962383663346164330a396430326562613737343234303838353264326630323635303033613435
+          64663964343938653235643266343366666132356261623337306363646635313665
+
+  tasks:
+    - name: update apt cache
+      apt:
+        update_cache: yes
+
+    - name: install postfix
+      apt:
+        name: postfix
+        state: installed
+      environment:
+        DEBIAN_FRONTEND: "noninteractive"
+
+    - name: install other packages
+      apt:
+        name: "{{ item }}"
+        state: installed
+      with_items:
+        - vim
+        - procps
+        - less
+        - rsyslog
+        - python-pexpect
+        - python-openssl
+        - opendkim
+        - opendkim-tools
+        - postsrsd
+
+    - name: start rsyslog
+      command: service rsyslog start
+
+    - name: set basic settings in main.cf
+      copy:
+        content: |
+          # /etc/postfix/main.cf
+          # Host and site name.
+          myhostname = {{ mail_domain }}
+          mydomain = {{ domain }}
+          myorigin = {{ domain }}
+          # Virtual aliases.
+          virtual_alias_domains = {{ domain }}
+          virtual_alias_maps = hash:/etc/postfix/virtual
+        dest: /etc/postfix/main.cf
+
+    - name: set up forwarding mapping
+      copy:
+        content: |
+          # /etc/postfix/virtual
+          # Forwarding mapping, one from-to address pair per line. The format is:
+          #     <forward-from-addr> <whitespace> <forward-to-addr>
+          {{ username }}@{{ domain }}      {{ forward_email }}
+        dest: /etc/postfix/virtual
+
+    - name: patch /etc/postfix/master.cf to prevent chrooting 
+      replace:
+        path: /etc/postfix/master.cf
+        regexp: '^(\S+\s+\S+\s+\S+\s+\S+\s+)y(.*)$'
+        replace: '\1n\2'
+        backup: yes
+
+    - name: notify postfix about changes to /etc/postfix/virtual
+      command: postmap /etc/postfix/virtual
+
+    - name: restart postfix to apply changes to *.cf
+      command: postfix {{ item }}
+      with_items:
+        - start
+        - reload
+
+    - name: install sasl2
+      apt:
+        name: "{{ item }}"
+        state: installed
+      with_items:
+        - sasl2-bin
+        - libsasl2-modules
+
+    - name: set sasl2 password 
+      expect:
+        command: saslpasswd2 -c -u {{ domain }} smtp
+        responses:
+          'Password: ' : "{{ sasl2_password }}"
+          'Again \(for verification\): ' : "{{ sasl2_password }}"
+
+    - name: set sasl db mode
+      file:
+        path: /etc/sasldb2
+        owner: postfix
+        mode: 0400
+
+    - name: configure sasl
+      copy:
+        content: |
+          pwcheck_method: auxprop
+          auxprop_plugin: sasldb
+          mech_list: PLAIN LOGIN CRAM-MD5 DIGEST-MD5 NTLM
+          log_level: 7
+        dest: /etc/postfix/sasl/smtpd.conf
+
+    - name: generate key pair 
+      openssl_privatekey:
+        path: "/tmp/{{ domain }}.key"
+
+    - name: generate CSR
+      openssl_csr:
+        path: "/tmp/{{ domain }}.csr"
+        privatekey_path: "/tmp/{{ domain }}.key"
+        country_name: "{{ country }}"
+        organization_name: "{{ organization }}"
+        email_address: "{{ username }}@{{ domain }}"
+        common_name: "{{ domain }}"
+
+    - name: generate certificate
+      openssl_certificate:
+        path: "/tmp/{{ domain }}.crt"
+        privatekey_path: "/tmp/{{ domain }}.key"
+        csr_path: "/tmp/{{ domain }}.csr"
+        provider: selfsigned
+
+    - name: create pem file
+      shell: >
+        cat /tmp/{{ domain }}.crt 
+        /tmp/{{ domain }}.key > 
+        /tmp/{{ domain }}.pem
+
+    - name: copy certificate
+      copy: 
+        remote_src: yes 
+        src: "/tmp/{{ domain }}.pem"
+        dest: "/etc/postfix/"
+
+    - name: set certificate mode
+      file:
+        path: "/etc/postfix/{{ domain }}.pem"
+        owner: root
+        mode: 0400
+
+    - name: remove temporary files
+      file: path="/tmp/{{ domain }}.{{ item }}" state=absent
+      with_items:
+        - path: "pem"
+        - path: "key"
+        - path: "crt"
+        - path: "csr"
+
+    - name: enable relaying
+      blockinfile:
+        path: /etc/postfix/master.cf
+        marker: "# Relaying settings"
+        block: |
+          submission inet n       -       n       -       -       smtpd
+            -o syslog_name=postfix/submission
+            -o smtpd_tls_security_level=may
+            -o smtpd_tls_cert_file=/etc/postfix/{{ domain }}.pem
+            -o smtpd_sasl_auth_enable=yes
+            -o smtpd_reject_unlisted_recipient=no
+            -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+            -o milter_macro_daemon_name=ORIGINATING
+
+    - name: apply changes to master.cf
+      command: postfix reload
+
+    - name: edit DKIM settings
+      copy:
+        content: |
+          # OpenDKIM config.
+          # Log to syslog
+          Syslog                  yes
+          SyslogSuccess           yes
+          LogWhy                  yes
+          # Required to use local socket with MTAs that access the socket as a non-
+          # privileged user (e.g. Postfix)
+          UMask                   002
+          Mode                    sv
+          PidFile                 /var/run/opendkim/opendkim.pid
+          UserID                  opendkim:opendkim
+          Socket                  inet:12301@localhost
+          Canonicalization        relaxed/simple
+          SignatureAlgorithm      rsa-sha256
+          # Sign for example.com with key in /etc/opendkim.d/mail.private using
+          # selector 'mail' (e.g. mail._domainkey.example.com)
+          Domain                  {{ domain }}
+          KeyFile                 /etc/opendkim.d/mail.private
+          Selector                mail
+          ExternalIgnoreList      refile:/etc/opendkim.d/TrustedHosts
+          InternalHosts           refile:/etc/opendkim.d/TrustedHosts
+        dest: /etc/opendkim.conf
+
+    - name: create directory for DKIM files
+      file:
+        path: /etc/opendkim.d
+        state: directory
+
+    - name: set up DKIM TrustedHosts
+      copy:
+        content: |
+          127.0.0.1
+          ::1
+          localhost
+          192.168.0.1/24
+          *.{{ domain }}
+        dest: /etc/opendkim.d/TrustedHosts
+
+    - name: generate DKIM key
+      shell: opendkim-genkey -s mail -d {{ domain }}
+      args:
+        chdir: /etc/opendkim.d
+
+    - name: set private key mode
+      file:
+        path: /etc/opendkim.d/mail.private
+        owner: opendkim
+        group: opendkim
+        mode: 600
+
+    - name: start DKIM server
+      command: /etc/init.d/opendkim start
+
+    - name: configure DKIM for postfix
+      blockinfile:
+        path: /etc/postfix/main.cf
+        marker: "# DKIM settings"
+        block: |
+          # Milter settings.
+          milter_protocol = 2
+          milter_default_action = accept
+          # OpenDKIM runs on port 12301.
+          smtpd_milters = inet:localhost:12301
+          non_smtpd_milters = inet:localhost:12301
+
+    - name: apply changes to main.cf
+      command: postfix reload
+
+    - name: remind about changing DNS record
+      debug:
+         msg: "Don't forget to update DNS TXT record
+           from /etc/opendkim.d/mail.txt:"
+
+    - name: read new DKIM record
+      slurp:
+        src: /etc/opendkim.d/mail.txt
+      register: dkim_record
+
+    - name: remind about changing DNS record
+      debug:
+         msg: "{{ dkim_record['content'] | b64decode
+          | regex_replace('\n') 
+          | regex_replace('\\s')
+          | regex_replace('\"') 
+          | regex_replace('\\(') 
+          | regex_replace('\\)')
+          | regex_replace('^.*(v=DKIM1.*)-----DKIM.*$', '\\1') }}"
+    
+    - name: edit postsrsd host name
+      lineinfile:
+        path: /etc/default/postsrsd
+        regexp: '^SRS_DOMAIN='
+        line: 'SRS_DOMAIN={{ domain }}'
+
+    - name: edit postsrsd settings
+      blockinfile:
+        path: /etc/postfix/main.cf
+        marker: "# PostSRSd settings"
+        block: |
+          sender_canonical_maps = tcp:localhost:10001
+          sender_canonical_classes = envelope_sender
+          recipient_canonical_maps = tcp:localhost:10002
+          recipient_canonical_classes= envelope_recipient,header_recipient
+
+    - name: start postsrsd
+      command: service postsrsd start
+
+    - name: apply changes to main.cf
+      command: postfix reload
+
+    - name: enable TLS
+      blockinfile:
+        path: /etc/postfix/main.cf
+        marker: "# TLS setting"
+        block: |
+          smtp_tls_security_level = may
+
+    - name: apply changes to main.cf
+      command: postfix reload
+
+    - name: create entrypoint script
+      copy:
+        content: |
+          #!/bin/bash
+          service rsyslog start 
+          /etc/init.d/opendkim start &
+          service postsrsd start
+          /usr/sbin/postfix start
+
+        dest: /root/entry.sh
